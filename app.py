@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Optional, Set
+import threading
 
 import requests
 
@@ -85,94 +86,117 @@ def _get_sonarr_base():
     return base, headers
 
 
-def build_sonarr_episode_history_for(target_episode_ids: Set[int]) -> Dict[int, datetime]:
+def get_sonarr_episode_earliest_import_from_series_history(
+    episode_id: int,
+    series_id: Optional[int] = None,
+) -> Optional[datetime]:
     """
-    Return mapping episodeId -> earliest import date, but only for the given target_episode_ids.
+    Query Sonarr's /api/v3/history/series for a single episode and return the
+    earliest *import* history date for that episode (UTC).
+
+    This is much faster than scanning the entire /api/v3/history list.
     """
     base, headers = _get_sonarr_base()
     if not base:
-        return {}
+        return None
 
-    if not target_episode_ids:
-        logger.info("No target Sonarr episode IDs provided, nothing to look up.")
-        return {}
+    url = base + "history/series"
+    params = {
+        "page": 1,
+        "pageSize": 20,          # small number; per-episode history is tiny
+        "sortKey": "date",
+        "sortDirection": "ascending",
+        "includeSeries": "true",
+        "includeEpisode": "true",
+        "episodeId": episode_id,
+    }
+    if series_id is not None:
+        params["seriesId"] = series_id
 
     logger.info(
-        "Building Sonarr episode history for %d target episode(s): %s",
-        len(target_episode_ids),
-        sorted(target_episode_ids),
+        "Querying Sonarr /history/series for episodeId=%s, seriesId=%s",
+        episode_id,
+        series_id,
     )
 
-    earliest: Dict[int, datetime] = {}
-    page = 1
-    page_size = 1000
-
-    while True:
-        params = {
-            "page": page,
-            "pageSize": page_size,
-            "sortKey": "date",
-            "sortDirection": "ascending",
-            "includeSeries": "true",
-            "includeEpisode": "true",
-        }
-        resp = requests.get(base + "history", headers=headers, params=params, timeout=60)
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-
-        records = data.get("records") if isinstance(data, dict) else data
-        if not records:
-            break
-
-        for rec in records:
-            event_type = rec.get("eventType") or rec.get("event_type")
-            if not event_type:
-                continue
-            if "import" not in str(event_type).lower():
-                continue
-
-            episode_id = rec.get("episodeId")
-            if not episode_id and rec.get("episode"):
-                episode_id = rec["episode"].get("id")
-            if not episode_id:
-                continue
-
-            if episode_id not in target_episode_ids:
-                continue
-
-            date_str = rec.get("date") or rec.get("eventDate")
-            dt = parse_date(date_str)
-            if not dt:
-                continue
-
-            current = earliest.get(episode_id)
-            if current is None or dt < current:
-                earliest[episode_id] = dt
-
-        total_records = data.get("totalRecords") if isinstance(data, dict) else None
-        logger.debug(
-            "Sonarr history page %s processed for targeted episodes, %s records, totalRecords=%s",
-            page,
-            len(records),
-            total_records,
+    except Exception as e:
+        logger.error(
+            "Error calling Sonarr /api/v3/history/series for episodeId=%s: %s",
+            episode_id,
+            e,
         )
+        return None
 
-        # If we've found all target episode IDs, we can stop early.
-        if len(earliest) >= len(target_episode_ids):
-            logger.info("Found earliest history for all target Sonarr episodes, stopping early.")
-            break
+    data = resp.json() or {}
+    records = data.get("records") or []
 
-        if total_records is None or page * page_size >= total_records:
-            break
+    if not records:
+        logger.warning(
+            "No Sonarr history/series records returned for episodeId=%s (seriesId=%s)",
+            episode_id,
+            series_id,
+        )
+        return None
 
-        page += 1
+    # History is already sorted ascending by date, but we still filter
+    # for import-type events and pick the earliest timestamp just in case.
+    earliest_dt: Optional[datetime] = None
+
+    for rec in records:
+        event_type = rec.get("eventType") or rec.get("event_type")
+        if not event_type or "import" not in str(event_type).lower():
+            continue
+
+        date_str = rec.get("date") or rec.get("eventDate")
+        dt = parse_date(date_str)
+        if not dt:
+            continue
+
+        if earliest_dt is None or dt < earliest_dt:
+            earliest_dt = dt
+
+    if not earliest_dt:
+        logger.warning(
+            "No import-type history found in /history/series for episodeId=%s (seriesId=%s)",
+            episode_id,
+            series_id,
+        )
+        return None
 
     logger.info(
-        "Built Sonarr earliest-import map for %d/%d target episode(s).",
-        len(earliest),
-        len(target_episode_ids),
+        "Earliest Sonarr import history for episodeId=%s (seriesId=%s): %s",
+        episode_id,
+        series_id,
+        earliest_dt.isoformat(),
     )
-    return earliest
+    return earliest_dt
+
+
+def get_sonarr_earliest_import_for_episodes(
+    episode_ids: Set[int],
+    series_id: Optional[int],
+) -> Dict[int, datetime]:
+    """
+    For a small set of episodes (e.g. from a webhook), query Sonarr's
+    /history/series for each one individually and return a map of
+    episodeId -> earliest datetime.
+    """
+    results: Dict[int, datetime] = {}
+
+    for eid in sorted(episode_ids):
+        dt = get_sonarr_episode_earliest_import_from_series_history(eid, series_id)
+        if dt is not None:
+            results[eid] = dt
+        else:
+            logger.warning(
+                "Could not determine earliest import for episodeId=%s via /history/series",
+                eid,
+            )
+
+    return results
 
 
 def build_sonarr_episode_history_full() -> Dict[int, datetime]:
@@ -314,6 +338,8 @@ def update_sonarr_file_timestamps_full() -> None:
 def update_sonarr_from_webhook(payload: dict) -> None:
     """
     Incremental Sonarr run: only update the episode file(s) involved in this webhook.
+
+    Uses /api/v3/history/series per-episode to avoid scanning massive global history.
     """
     event_type = str(payload.get("eventType", "")).lower()
     logger.info("Sonarr webhook eventType='%s'", event_type)
@@ -321,6 +347,9 @@ def update_sonarr_from_webhook(payload: dict) -> None:
     if "download" not in event_type and "grab" not in event_type and "rename" not in event_type:
         logger.info("Sonarr webhook eventType not a download/import event, nothing to do.")
         return
+
+    series = payload.get("series") or {}
+    series_id = series.get("id")
 
     episodes = payload.get("episodes") or []
     ep_ids: Set[int] = set()
@@ -350,13 +379,19 @@ def update_sonarr_from_webhook(payload: dict) -> None:
         sorted(ep_ids),
     )
 
-    earliest_map = build_sonarr_episode_history_for(ep_ids)
-    if not earliest_map:
-        logger.warning(
-            "No Sonarr history found for the target episodes; keeping timestamp as-is for %s",
-            path,
-        )
-        return
+    logger.info(
+        "Building Sonarr episode history via /history/series for %d target episode(s): %s",
+        len(ep_ids),
+        sorted(ep_ids),
+    )
+
+    earliest_map = get_sonarr_earliest_import_for_episodes(ep_ids, series_id)
+
+    logger.info(
+        "Built Sonarr earliest-import map (via /history/series) for %d/%d target episode(s).",
+        len(earliest_map),
+        len(ep_ids),
+    )
 
     file_dt: Optional[datetime] = None
     for eid in ep_ids:
@@ -663,11 +698,28 @@ def update_radarr_from_webhook(payload: dict) -> None:
 class TimestampHandler(BaseHTTPRequestHandler):
     def _send_json(self, status_code: int, payload: dict):
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            logger.warning(
+                "Client closed connection before response could be sent (BrokenPipeError)."
+            )
+        except ConnectionResetError:
+            logger.warning(
+                "Client reset connection before response could be sent (ConnectionResetError)."
+            )
+        except Exception:
+            logger.exception("Unexpected error while sending HTTP response")
+
+    def _run_in_background(self, fn, *args, **kwargs):
+        """Run a function in a background thread (fire-and-forget)."""
+        t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+        t.start()
+        return t
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", "0") or "0")
@@ -684,49 +736,87 @@ class TimestampHandler(BaseHTTPRequestHandler):
             list(body.keys()),
         )
 
+        # --- SONARR ---
         if self.path.startswith("/sonarr"):
-            # Distinguish webhook vs manual
             if "eventType" in body:
-                logger.info("Triggered Sonarr webhook (incremental) timestamp update.")
+                # Webhook path: do work in the background, respond immediately
+                logger.info(
+                    "Triggered Sonarr webhook (incremental) timestamp update (background job)."
+                )
                 try:
-                    update_sonarr_from_webhook(body)
-                    self._send_json(200, {"status": "ok", "message": "Sonarr webhook update complete"})
+                    self._run_in_background(update_sonarr_from_webhook, body)
+                    self._send_json(
+                        200,
+                        {
+                            "status": "ok",
+                            "message": "Sonarr webhook update scheduled (running in background)",
+                        },
+                    )
                 except Exception as e:
-                    logger.exception("Error while processing Sonarr webhook request")
-                    self._send_json(500, {"status": "error", "message": str(e)})
+                    logger.exception("Error while scheduling Sonarr webhook request")
+                    self._send_json(
+                        500,
+                        {"status": "error", "message": f"Failed to schedule job: {e}"},
+                    )
             else:
+                # Manual/full call: we block until done
                 logger.info("Triggered Sonarr full-library timestamp update (manual).")
                 try:
                     update_sonarr_file_timestamps_full()
-                    self._send_json(200, {"status": "ok", "message": "Sonarr full-library update complete"})
+                    self._send_json(
+                        200,
+                        {"status": "ok", "message": "Sonarr full-library update complete"},
+                    )
                 except Exception as e:
                     logger.exception("Error while processing Sonarr full update request")
                     self._send_json(500, {"status": "error", "message": str(e)})
 
+        # --- RADARR ---
         elif self.path.startswith("/radarr"):
             if "eventType" in body:
-                logger.info("Triggered Radarr webhook (incremental) timestamp update.")
+                logger.info(
+                    "Triggered Radarr webhook (incremental) timestamp update (background job)."
+                )
                 try:
-                    update_radarr_from_webhook(body)
-                    self._send_json(200, {"status": "ok", "message": "Radarr webhook update complete"})
+                    self._run_in_background(update_radarr_from_webhook, body)
+                    self._send_json(
+                        200,
+                        {
+                            "status": "ok",
+                            "message": "Radarr webhook update scheduled (running in background)",
+                        },
+                    )
                 except Exception as e:
-                    logger.exception("Error while processing Radarr webhook request")
-                    self._send_json(500, {"status": "error", "message": str(e)})
+                    logger.exception("Error while scheduling Radarr webhook request")
+                    self._send_json(
+                        500,
+                        {"status": "error", "message": f"Failed to schedule job: {e}"},
+                    )
             else:
                 logger.info("Triggered Radarr full-library timestamp update (manual).")
                 try:
                     update_radarr_file_timestamps_full()
-                    self._send_json(200, {"status": "ok", "message": "Radarr full-library update complete"})
+                    self._send_json(
+                        200,
+                        {"status": "ok", "message": "Radarr full-library update complete"},
+                    )
                 except Exception as e:
                     logger.exception("Error while processing Radarr full update request")
                     self._send_json(500, {"status": "error", "message": str(e)})
 
+        # --- FULL BOTH ---
         elif self.path.startswith("/full"):
             logger.info("Triggered Sonarr + Radarr full-library timestamp update (manual).")
             try:
                 update_sonarr_file_timestamps_full()
                 update_radarr_file_timestamps_full()
-                self._send_json(200, {"status": "ok", "message": "Sonarr + Radarr full-library update complete"})
+                self._send_json(
+                    200,
+                    {
+                        "status": "ok",
+                        "message": "Sonarr + Radarr full-library update complete",
+                    },
+                )
             except Exception as e:
                 logger.exception("Error while processing /full update request")
                 self._send_json(500, {"status": "error", "message": str(e)})
@@ -746,7 +836,9 @@ def run_server():
     logger.info("first-imported-timestamper HTTP server listening on port %d", port)
 
     if os.getenv("RUN_FULL_ON_START", "false").lower() == "true":
-        logger.info("RUN_FULL_ON_START=true, performing one-time full Sonarr + Radarr update on startup...")
+        logger.info(
+            "RUN_FULL_ON_START=true, performing one-time full Sonarr + Radarr update on startup..."
+        )
         try:
             update_sonarr_file_timestamps_full()
             update_radarr_file_timestamps_full()
