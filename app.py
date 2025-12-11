@@ -28,6 +28,12 @@ if DRY_RUN:
 else:
     logger.info("Dry run disabled: timestamps WILL be modified.")
 
+# ---------- SONARR SERIES-LEVEL CACHE ----------
+
+# Cache: seriesId -> { episodeId -> earliest_import_datetime }
+SONARR_SERIES_IMPORT_CACHE: Dict[int, Dict[int, datetime]] = {}
+SONARR_SERIES_CACHE_LOCK = threading.Lock()
+
 
 def parse_date(date_str: str) -> Optional[datetime]:
     """Parse ISO-ish date strings from Sonarr/Radarr into timezone-aware UTC datetimes."""
@@ -182,28 +188,190 @@ def get_sonarr_episode_earliest_import_from_series_history(
     return earliest_dt
 
 
+def build_sonarr_series_import_map(series_id: int) -> Dict[int, datetime]:
+    """
+    Build a mapping episodeId -> earliest import datetime (UTC) for a single
+    Sonarr series, using /api/v3/history/series.
+
+    This lets us pay for one Sonarr API call per series instead of one per episode.
+    """
+    base, headers = _get_sonarr_base()
+    if not base:
+        return {}
+
+    url = base + "history/series"
+    params = {
+        "page": 1,
+        "pageSize": 1000,          # big enough for typical home setups
+        "sortKey": "date",
+        "sortDirection": "ascending",
+        "includeSeries": "true",
+        "includeEpisode": "true",
+        "seriesId": series_id,
+    }
+
+    logger.info(
+        "Building Sonarr series import map via /history/series for seriesId=%s",
+        series_id,
+    )
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(
+            "Error calling Sonarr /api/v3/history/series for seriesId=%s: %s",
+            series_id,
+            e,
+        )
+        return {}
+
+    data = resp.json() or []
+
+    # Handle both:
+    #  - list: [ {...}, {...}, ... ]
+    #  - dict: { "records": [ {...}, ... ], ... }
+    if isinstance(data, dict):
+        records = data.get("records") or []
+    else:
+        records = data
+
+    if not records:
+        logger.warning(
+            "No Sonarr history/series records returned for seriesId=%s",
+            series_id,
+        )
+        return {}
+
+    earliest: Dict[int, datetime] = {}
+
+    for rec in records:
+        event_type = rec.get("eventType") or rec.get("event_type")
+        if not event_type or "import" not in str(event_type).lower():
+            continue
+
+        episode_id = rec.get("episodeId")
+        if not episode_id and rec.get("episode"):
+            episode_id = rec["episode"].get("id")
+        if not episode_id:
+            continue
+
+        date_str = rec.get("date") or rec.get("eventDate")
+        dt = parse_date(date_str)
+        if not dt:
+            continue
+
+        current = earliest.get(episode_id)
+        if current is None or dt < current:
+            earliest[episode_id] = dt
+
+    logger.info(
+        "Built Sonarr series import map for seriesId=%s: %d episode(s) with import history.",
+        series_id,
+        len(earliest),
+    )
+    return earliest
+
+
+def get_sonarr_series_import_map(series_id: int) -> Dict[int, datetime]:
+    """
+    Return a cached mapping of episodeId -> earliest import datetime for a series.
+    If not cached yet, build it via /history/series and cache the result.
+    """
+    with SONARR_SERIES_CACHE_LOCK:
+        cached = SONARR_SERIES_IMPORT_CACHE.get(series_id)
+    if cached is not None:
+        logger.info(
+            "Using cached Sonarr import map for seriesId=%s (%d episode(s)).",
+            series_id,
+            len(cached),
+        )
+        return cached
+
+    # Not cached yet: build it.
+    mapping = build_sonarr_series_import_map(series_id)
+
+    with SONARR_SERIES_CACHE_LOCK:
+        SONARR_SERIES_IMPORT_CACHE[series_id] = mapping
+
+    return mapping
+
+
 def get_sonarr_earliest_import_for_episodes(
     episode_ids: Set[int],
     series_id: Optional[int],
 ) -> Dict[int, datetime]:
     """
-    For a small set of episodes (e.g. from a webhook), query Sonarr's
-    /history/series for each one individually and return a map of
-    episodeId -> earliest datetime.
+    Return mapping episodeId -> earliest import date for the given episode_ids.
+
+    Optimization:
+      - If series_id is provided, we try to use a cached per-series import map
+        (built once via /history/series?seriesId=X) so that multiple episodes
+        in the same series don't each hit Sonarr individually.
+      - If series_id is missing or the series-level map doesn't have an entry
+        for a given episode, we fall back to the per-episode /history/series call.
     """
-    results: Dict[int, datetime] = {}
+    base, headers = _get_sonarr_base()
+    if not base:
+        return {}
+
+    if not episode_ids:
+        logger.info("No target Sonarr episode IDs provided, nothing to look up.")
+        return {}
+
+    logger.info(
+        "Building Sonarr episode history via /history/series for %d target episode(s): %s",
+        len(episode_ids),
+        sorted(episode_ids),
+    )
+
+    earliest: Dict[int, datetime] = {}
+
+    series_map: Dict[int, datetime] = {}
+    if series_id is not None:
+        try:
+            series_map = get_sonarr_series_import_map(series_id)
+        except Exception as e:
+            logger.error(
+                "Error building series-level import map for seriesId=%s; "
+                "falling back to per-episode history lookups. Error: %s",
+                series_id,
+                e,
+            )
+            series_map = {}
 
     for eid in sorted(episode_ids):
-        dt = get_sonarr_episode_earliest_import_from_series_history(eid, series_id)
+        dt: Optional[datetime] = None
+
+        # First try the series-level cache (if available)
+        if series_map:
+            dt = series_map.get(eid)
+            if dt:
+                logger.debug(
+                    "Using cached series-level history for episodeId=%s (seriesId=%s): %s",
+                    eid,
+                    series_id,
+                    dt.isoformat(),
+                )
+
+        # If that didn't give us a datetime, fall back to a per-episode call
+        if dt is None:
+            dt = get_sonarr_episode_earliest_import_from_series_history(eid, series_id)
+
         if dt is not None:
-            results[eid] = dt
+            earliest[eid] = dt
         else:
             logger.warning(
-                "Could not determine earliest import for episodeId=%s via /history/series",
+                "Could not determine earliest import for episodeId=%s via series cache or per-episode lookup",
                 eid,
             )
 
-    return results
+    logger.info(
+        "Built Sonarr earliest-import map (via /history/series) for %d/%d target episode(s).",
+        len(earliest),
+        len(episode_ids),
+    )
+    return earliest
 
 
 def build_sonarr_episode_history_full() -> Dict[int, datetime]:
@@ -346,7 +514,7 @@ def update_sonarr_from_webhook(payload: dict) -> None:
     """
     Incremental Sonarr run: only update the episode file(s) involved in this webhook.
 
-    Uses /api/v3/history/series per-episode to avoid scanning massive global history.
+    Uses /api/v3/history/series (with per-series cache) to avoid scanning massive global history.
     """
     event_type = str(payload.get("eventType", "")).lower()
     logger.info("Sonarr webhook eventType='%s'", event_type)
@@ -386,19 +554,7 @@ def update_sonarr_from_webhook(payload: dict) -> None:
         sorted(ep_ids),
     )
 
-    logger.info(
-        "Building Sonarr episode history via /history/series for %d target episode(s): %s",
-        len(ep_ids),
-        sorted(ep_ids),
-    )
-
     earliest_map = get_sonarr_earliest_import_for_episodes(ep_ids, series_id)
-
-    logger.info(
-        "Built Sonarr earliest-import map (via /history/series) for %d/%d target episode(s).",
-        len(earliest_map),
-        len(ep_ids),
-    )
 
     file_dt: Optional[datetime] = None
     for eid in ep_ids:
