@@ -130,8 +130,15 @@ def get_sonarr_episode_earliest_import_from_series_history(
         )
         return None
 
-    data = resp.json() or {}
-    records = data.get("records") or []
+    # Sonarr can return either:
+    #  - a plain list: [ {...}, {...}, ... ]
+    #  - or a paged object: { "records": [ {...}, ... ], "totalRecords": N, ... }
+    data = resp.json() or []
+
+    if isinstance(data, dict):
+        records = data.get("records") or []
+    else:
+        records = data
 
     if not records:
         logger.warning(
