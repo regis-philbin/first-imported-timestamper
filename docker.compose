@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  first-imported-timestamper:
+    image: ghcr.io/regis-philbin/first-imported-timestamper:latest
+    container_name: first-imported-timestamper
+    restart: unless-stopped
+
+    environment:
+      SONARR_URL: "http://0.0.0.0:8989"
+      SONARR_API_KEY: "SONARR-API-KEY"
+      RADARR_URL: "http://0.0.0.0:7878"
+      RADARR_API_KEY: "RADARR-API-KEY"
+
+      # DEBUG / INFO / WARNING / ERROR
+      LOG_LEVEL: "INFO"
+      PORT: "8095"
+      RUN_FULL_ON_START: "false"
+      DRY_RUN: "false"
+
+    volumes:
+      - /data/media:/data/media:rw
+
+    ports:
+      - "8095:8095"
